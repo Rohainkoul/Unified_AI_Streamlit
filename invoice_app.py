@@ -121,7 +121,12 @@ def _prepare_streamlit_headless_opencv():
     )
 
 
-_prepare_streamlit_headless_opencv()
+# Streamlit Cloud:
+# use the installed opencv-python-headless package directly.
+# The old temporary cv2 bootstrap causes recursive binary loading
+# on Linux / Streamlit Community Cloud.
+#
+# _prepare_streamlit_headless_opencv()
 
 
 

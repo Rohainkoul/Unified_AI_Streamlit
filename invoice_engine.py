@@ -15378,35 +15378,87 @@ def _v9_document_lines(input_path):
 
 def _v9_amount_tokens(text):
 
+    """
+    Safe monetary-number tokenizer.
+
+    Deliberately avoids the previous complex currency regex.
+    Handles:
+      16,461.00
+      1,29,954.00
+      2488810.00
+      -0.29
+      ? 26,739.00
+      INR 59,319.78
+
+    Percent values are rejected.
+    """
+
+    text = str(text or "")
+
     output = []
 
-    pattern = re.compile(
-        r"(?<![A-Za-z0-9])"
-        r"(?:?|Rs\.?|INR)?\s*"
-        r"[-+]?"
-        r"(?:"
-        r"\d{1,3}(?:,\d{2,3})+"
-        r"|"
-        r"\d+"
-        r")"
-        r"(?:\.\d{1,4})?"
-        r"(?![A-Za-z0-9])",
-        re.IGNORECASE,
+    # Strip common currency markers before numeric scanning.
+    cleaned = (
+        text
+        .replace("?", " ")
+        .replace("Rs.", " ")
+        .replace("Rs", " ")
+        .replace("INR", " ")
+        .replace("USD", " ")
+        .replace("EUR", " ")
+        .replace("GBP", " ")
+        .replace("$", " ")
+        .replace("?", " ")
+        .replace("?", " ")
     )
 
-    for match in pattern.finditer(
-        str(text)
-    ):
+    # Generic signed decimal/integer candidates with Indian or
+    # international comma grouping.
+    pattern = re.compile(
+        r"[-+]?(?:\d[\d,]*)(?:\.\d{1,4})?"
+    )
+
+    for match in pattern.finditer(cleaned):
 
         raw = match.group(0).strip()
 
-        after = str(text)[
+        if not raw:
+            continue
+
+        # Reject percentages such as 9.00%.
+        tail = cleaned[
             match.end():
-            match.end() + 3
+            match.end() + 4
         ]
 
-        # Percentages are rates, not financial amounts.
-        if "%" in after:
+        if "%" in tail:
+            continue
+
+        # Reject number fragments touching letters.
+        before = (
+            cleaned[match.start() - 1]
+            if match.start() > 0
+            else ""
+        )
+
+        after = (
+            cleaned[match.end()]
+            if match.end() < len(cleaned)
+            else ""
+        )
+
+        if (
+            before
+            and
+            before.isalpha()
+        ):
+            continue
+
+        if (
+            after
+            and
+            after.isalpha()
+        ):
             continue
 
         value = _v9_number(raw)

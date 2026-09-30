@@ -15192,3 +15192,2451 @@ def process_invoice_dynamic_final(
 # END V8.6 CUSTOMER ADDRESS FINAL GUARD
 # ============================================================
 
+
+
+# ============================================================
+# INVOICE_AI_V9_GENERALIZED_RECONCILIATION
+# ============================================================
+#
+# Generic final reconciliation layer for printed/digital and
+# OCR/scanned invoices.
+#
+# Designed around document structure and arithmetic, NOT vendor
+# names or specific invoice numbers.
+#
+# Handles:
+#   - Grand Total / Final Amount / Net Amount hierarchy
+#   - CGST + SGST / Central + State tax reconciliation
+#   - IGST
+#   - subtotal / taxable amount
+#   - discount
+#   - round-off
+#   - currency from explicit INR / currency symbols
+#   - payment terms + due date
+#   - customer-name recovery from Buyer/Bill-To blocks
+#   - dynamic-field canonicalization
+#   - HSN/SAC validation
+#   - IFSC / bank-account repair
+#   - vehicle-number false-positive rejection
+#   - financial arithmetic validation
+#
+# No retraining.
+# No LayoutLMv3 weight changes.
+# No OCR-model changes.
+# ============================================================
+
+
+_PROCESS_INVOICE_DYNAMIC_FINAL_BEFORE_V9 = (
+    process_invoice_dynamic_final
+)
+
+
+_V9_MISSING = {
+    "",
+    "not_detected",
+    "not detected",
+    "none",
+    "null",
+}
+
+
+def _v9_text(value):
+
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value or ""),
+    ).strip()
+
+
+def _v9_norm(value):
+
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        _v9_text(value).casefold(),
+    ).strip()
+
+
+def _v9_is_missing(value):
+
+    return (
+        _v9_norm(value)
+        in
+        _V9_MISSING
+    )
+
+
+def _v9_number(value):
+
+    if value is None:
+        return None
+
+    text = str(value)
+
+    text = (
+        text.replace(",", "")
+        .replace("?", "")
+        .replace("Rs.", "")
+        .replace("Rs", "")
+        .replace("INR", "")
+        .strip()
+    )
+
+    match = re.search(
+        r"[-+]?\d+(?:\.\d+)?",
+        text,
+    )
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def _v9_document_lines(input_path):
+
+    try:
+        lines = _v81_document_lines(
+            input_path
+        )
+    except Exception:
+        try:
+            lines = _dynamic_pdf_lines(
+                input_path
+            )
+        except Exception:
+            lines = []
+
+    if not isinstance(lines, list):
+        return []
+
+    output = []
+
+    for item in lines:
+
+        if not isinstance(item, dict):
+            continue
+
+        text = _v9_text(
+            item.get("text", "")
+        )
+
+        if not text:
+            continue
+
+        output.append(
+            {
+                "page":
+                    int(
+                        item.get(
+                            "page",
+                            1,
+                        )
+                        or
+                        1
+                    ),
+
+                "text":
+                    text,
+
+                "x0":
+                    float(
+                        item.get(
+                            "x0",
+                            0.0,
+                        )
+                        or
+                        0.0
+                    ),
+
+                "y0":
+                    float(
+                        item.get(
+                            "y0",
+                            0.0,
+                        )
+                        or
+                        0.0
+                    ),
+            }
+        )
+
+    output.sort(
+        key=lambda item: (
+            item["page"],
+            item["y0"],
+            item["x0"],
+        )
+    )
+
+    return output
+
+
+def _v9_amount_tokens(text):
+
+    output = []
+
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"(?:?|Rs\.?|INR)?\s*"
+        r"[-+]?"
+        r"(?:"
+        r"\d{1,3}(?:,\d{2,3})+"
+        r"|"
+        r"\d+"
+        r")"
+        r"(?:\.\d{1,4})?"
+        r"(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+
+    for match in pattern.finditer(
+        str(text)
+    ):
+
+        raw = match.group(0).strip()
+
+        after = str(text)[
+            match.end():
+            match.end() + 3
+        ]
+
+        # Percentages are rates, not financial amounts.
+        if "%" in after:
+            continue
+
+        value = _v9_number(raw)
+
+        if value is None:
+            continue
+
+        output.append(
+            (
+                value,
+                raw,
+                match.start(),
+                match.end(),
+            )
+        )
+
+    return output
+
+
+def _v9_alias_present(
+    text,
+    alias,
+):
+
+    normalized_text = (
+        _v9_norm(text)
+    )
+
+    normalized_alias = (
+        _v9_norm(alias)
+    )
+
+    if not normalized_alias:
+        return False
+
+    return (
+        normalized_alias
+        in
+        normalized_text
+    )
+
+
+def _v9_amount_after_alias(
+    text,
+    aliases,
+):
+
+    raw = str(text)
+
+    normalized_raw = (
+        _v9_norm(raw)
+    )
+
+    best = None
+
+    for priority, alias in enumerate(
+        aliases
+    ):
+
+        normalized_alias = (
+            _v9_norm(alias)
+        )
+
+        if (
+            not normalized_alias
+            or
+            normalized_alias
+            not in normalized_raw
+        ):
+            continue
+
+        amounts = (
+            _v9_amount_tokens(
+                raw
+            )
+        )
+
+        if not amounts:
+            continue
+
+        # Summary lines frequently contain a rate followed by
+        # the actual amount. The last non-percent amount is
+        # normally the monetary value.
+        value = amounts[-1][0]
+
+        score = (
+            1000
+            -
+            priority * 10
+        )
+
+        candidate = (
+            score,
+            value,
+        )
+
+        if (
+            best is None
+            or
+            candidate[0]
+            >
+            best[0]
+        ):
+            best = candidate
+
+    if best is None:
+        return None
+
+    return best[1]
+
+
+def _v9_best_labeled_amount(
+    lines,
+    aliases,
+    *,
+    reject_terms=None,
+):
+
+    reject_terms = (
+        reject_terms
+        or
+        []
+    )
+
+    if not lines:
+        return None
+
+    max_page = max(
+        item["page"]
+        for item
+        in lines
+    )
+
+    candidates = []
+
+    for index, line in enumerate(
+        lines
+    ):
+
+        text = line["text"]
+        norm = _v9_norm(text)
+
+        if any(
+            _v9_norm(term)
+            in
+            norm
+            for term
+            in reject_terms
+        ):
+            continue
+
+        for alias_rank, alias in enumerate(
+            aliases
+        ):
+
+            alias_norm = _v9_norm(
+                alias
+            )
+
+            if (
+                not alias_norm
+                or
+                alias_norm
+                not in norm
+            ):
+                continue
+
+            value = (
+                _v9_amount_after_alias(
+                    text,
+                    [alias],
+                )
+            )
+
+            # If label is isolated, inspect up to two lines
+            # immediately below it on the same page.
+            evidence = text
+
+            if value is None:
+
+                for offset in (1, 2):
+
+                    target_index = (
+                        index + offset
+                    )
+
+                    if (
+                        target_index
+                        >=
+                        len(lines)
+                    ):
+                        break
+
+                    target = lines[
+                        target_index
+                    ]
+
+                    if (
+                        target["page"]
+                        !=
+                        line["page"]
+                    ):
+                        break
+
+                    tokens = (
+                        _v9_amount_tokens(
+                            target["text"]
+                        )
+                    )
+
+                    if tokens:
+
+                        value = (
+                            tokens[-1][0]
+                        )
+
+                        evidence = (
+                            text
+                            +
+                            " | "
+                            +
+                            target["text"]
+                        )
+
+                        break
+
+            if value is None:
+                continue
+
+            # Strong explicit labels dominate, then prefer later
+            # pages because invoice summaries commonly occur
+            # after line-item pages.
+            score = (
+                10000
+                -
+                alias_rank * 500
+                +
+                line["page"] * 20
+            )
+
+            if (
+                line["page"]
+                ==
+                max_page
+            ):
+                score += 100
+
+            candidates.append(
+                {
+                    "value":
+                        value,
+
+                    "score":
+                        score,
+
+                    "page":
+                        line["page"],
+
+                    "evidence":
+                        evidence,
+
+                    "alias":
+                        alias,
+                }
+            )
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item:
+            item["score"],
+        reverse=True,
+    )
+
+    return candidates[0]
+
+
+def _v9_find_total(lines):
+
+    return _v9_best_labeled_amount(
+        lines,
+        [
+            "grand total",
+            "final amount",
+            "net amount rounded",
+            "net amount",
+            "invoice total",
+            "total amount",
+            "amount payable",
+            "bill amount",
+            "total",
+        ],
+        reject_terms=[
+            "total qty",
+            "total quantity",
+            "total gst",
+            "gst total",
+            "subtotal",
+            "sub total",
+            "taxable amount",
+            "taxable value",
+            "total tax",
+            "tax amount",
+            "amount in words",
+            "invoice amount in words",
+            "central tax",
+            "state tax",
+            "state ut tax",
+            "cgst",
+            "sgst",
+            "igst",
+            "ratewise summary",
+        ],
+    )
+
+
+def _v9_find_subtotal(lines):
+
+    return _v9_best_labeled_amount(
+        lines,
+        [
+            "taxable amount",
+            "total net value",
+            "taxable value",
+            "sub total",
+            "subtotal",
+            "basic amount",
+            "basic total",
+        ],
+        reject_terms=[
+            "total gst",
+            "tax amount",
+            "central tax",
+            "state tax",
+            "cgst",
+            "sgst",
+            "igst",
+        ],
+    )
+
+
+def _v9_find_discount(lines):
+
+    return _v9_best_labeled_amount(
+        lines,
+        [
+            "discount amount",
+            "discount",
+            "less discount",
+        ],
+    )
+
+
+def _v9_find_round_off(lines):
+
+    return _v9_best_labeled_amount(
+        lines,
+        [
+            "round off",
+            "roundoff",
+            "rounding off",
+        ],
+    )
+
+
+def _v9_find_tax_component(
+    lines,
+    aliases,
+):
+
+    return _v9_best_labeled_amount(
+        lines,
+        aliases,
+        reject_terms=[
+            "total gst in words",
+        ],
+    )
+
+
+def _v9_financial_candidates(
+    lines,
+):
+
+    total = _v9_find_total(
+        lines
+    )
+
+    subtotal = _v9_find_subtotal(
+        lines
+    )
+
+    discount = _v9_find_discount(
+        lines
+    )
+
+    round_off = _v9_find_round_off(
+        lines
+    )
+
+    cgst = _v9_find_tax_component(
+        lines,
+        [
+            "central tax",
+            "central gst",
+            "cgst",
+            "c gst output",
+        ],
+    )
+
+    sgst = _v9_find_tax_component(
+        lines,
+        [
+            "state/ut tax",
+            "state ut tax",
+            "state tax",
+            "state gst",
+            "sgst",
+            "s gst output",
+        ],
+    )
+
+    igst = _v9_find_tax_component(
+        lines,
+        [
+            "integrated tax",
+            "integrated gst",
+            "igst",
+        ],
+    )
+
+    tax = None
+
+    if (
+        cgst is not None
+        and
+        sgst is not None
+    ):
+
+        tax = (
+            cgst["value"]
+            +
+            sgst["value"]
+        )
+
+    elif igst is not None:
+
+        tax = (
+            igst["value"]
+        )
+
+    return {
+        "total":
+            total,
+
+        "subtotal":
+            subtotal,
+
+        "discount":
+            discount,
+
+        "round_off":
+            round_off,
+
+        "cgst":
+            cgst,
+
+        "sgst":
+            sgst,
+
+        "igst":
+            igst,
+
+        "tax":
+            tax,
+    }
+
+
+def _v9_field_value(
+    result,
+    name,
+):
+
+    fields = (
+        result.get(
+            "fields",
+            {},
+        )
+        if isinstance(
+            result,
+            dict,
+        )
+        else
+        {}
+    )
+
+    item = fields.get(
+        name
+    )
+
+    if isinstance(
+        item,
+        dict,
+    ):
+        return item.get(
+            "value"
+        )
+
+    return item
+
+
+def _v9_set_trained(
+    result,
+    name,
+    value,
+    source,
+):
+
+    if value is None:
+        return
+
+    fields = result.setdefault(
+        "fields",
+        {},
+    )
+
+    fields[name] = {
+        "value":
+            value,
+
+        "status":
+            "RECONCILED",
+
+        "source":
+            source,
+
+        "origin":
+            "TRAINED_SCHEMA",
+
+        "field_name":
+            name,
+    }
+
+
+def _v9_format_amount(value):
+
+    if value is None:
+        return None
+
+    return (
+        f"{float(value):,.2f}"
+    )
+
+
+def _v9_explicit_currency(lines):
+
+    for line in lines:
+
+        text = line["text"]
+
+        if re.search(
+            r"(?i)\bINR\b",
+            text,
+        ):
+            return "INR"
+
+        if "?" in text:
+            return "INR"
+
+        if re.search(
+            r"(?i)\bUSD\b",
+            text,
+        ):
+            return "USD"
+
+        if "$" in text:
+            return "USD"
+
+        if re.search(
+            r"(?i)\bEUR\b",
+            text,
+        ):
+            return "EUR"
+
+        if "?" in text:
+            return "EUR"
+
+        if re.search(
+            r"(?i)\bGBP\b",
+            text,
+        ):
+            return "GBP"
+
+        if "?" in text:
+            return "GBP"
+
+    return None
+
+
+def _v9_recover_payment_terms(
+    lines,
+):
+
+    patterns = [
+        r"(?i)\bterms?\s+of\s+payment\s*[:\-]?\s*(.+)$",
+        r"(?i)\bpayment\s+terms?\s*[:\-]?\s*(.+)$",
+    ]
+
+    for line in lines:
+
+        text = line["text"]
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                text,
+            )
+
+            if not match:
+                continue
+
+            value = _v9_text(
+                match.group(1)
+            )
+
+            value = re.split(
+                r"(?i)\b("
+                r"due\s*date|"
+                r"invoice|"
+                r"gst|"
+                r"total"
+                r")\b",
+                value,
+                maxsplit=1,
+            )[0].strip(" :-")
+
+            if (
+                value
+                and
+                len(value)
+                <=
+                80
+            ):
+                return value
+
+    return None
+
+
+def _v9_recover_due_date(
+    lines,
+):
+
+    for line in lines:
+
+        text = line["text"]
+
+        match = re.search(
+            r"(?i)"
+            r"\b(?:payment\s+)?due\s+date"
+            r"\s*[:\-]?\s*"
+            r"(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4})",
+            text,
+        )
+
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def _v9_company_from_customer_block(
+    lines,
+    vendor_name=None,
+):
+
+    vendor_norm = _v9_norm(
+        vendor_name
+    )
+
+    anchor = re.compile(
+        r"(?i)\b("
+        r"bill\s*to|"
+        r"billed\s*to|"
+        r"buyer(?:\s+name)?|"
+        r"customer(?:\s+name)?|"
+        r"consignee"
+        r")\b"
+    )
+
+    company_pattern = re.compile(
+        r"(?i)"
+        r"([A-Z][A-Z0-9&.,'()/\- ]{3,120}?"
+        r"(?:"
+        r"PRIVATE\s+LIMITED|"
+        r"PVT\.?\s*LTD\.?|"
+        r"LIMITED|"
+        r"LTD\.?|"
+        r"ENTERPRISES|"
+        r"TRADING|"
+        r"INDUSTRIES|"
+        r"SERVICES"
+        r"))"
+    )
+
+    for index, line in enumerate(
+        lines
+    ):
+
+        if not anchor.search(
+            line["text"]
+        ):
+            continue
+
+        page = line["page"]
+
+        candidates = [
+            line["text"]
+        ]
+
+        for offset in range(
+            1,
+            6,
+        ):
+
+            target_index = (
+                index + offset
+            )
+
+            if (
+                target_index
+                >=
+                len(lines)
+            ):
+                break
+
+            target = lines[
+                target_index
+            ]
+
+            if (
+                target["page"]
+                !=
+                page
+            ):
+                break
+
+            candidates.append(
+                target["text"]
+            )
+
+        for candidate in candidates:
+
+            for match in company_pattern.finditer(
+                candidate
+            ):
+
+                name = _v9_text(
+                    match.group(1)
+                ).strip(" ,:-")
+
+                normalized = (
+                    _v9_norm(name)
+                )
+
+                if not normalized:
+                    continue
+
+                if (
+                    vendor_norm
+                    and
+                    normalized
+                    ==
+                    vendor_norm
+                ):
+                    continue
+
+                if len(name) < 5:
+                    continue
+
+                return name
+
+    return None
+
+
+def _v9_find_after_label(
+    lines,
+    aliases,
+):
+
+    for line in lines:
+
+        text = line["text"]
+
+        for alias in aliases:
+
+            match = re.search(
+                r"(?i)\b"
+                +
+                re.escape(alias)
+                +
+                r"\b"
+                r"\s*[:=\-]?\s*"
+                r"(.+)$",
+                text,
+            )
+
+            if not match:
+                continue
+
+            value = _v9_text(
+                match.group(1)
+            )
+
+            if not value:
+                continue
+
+            return (
+                value,
+                text,
+                line["page"],
+            )
+
+    return None
+
+
+def _v9_explicit_ifsc(lines):
+
+    pattern = re.compile(
+        r"(?i)\b"
+        r"([A-Z]{4}0[A-Z0-9]{6})"
+        r"\b"
+    )
+
+    for line in lines:
+
+        if (
+            "ifsc"
+            not in
+            _v9_norm(
+                line["text"]
+            )
+        ):
+            continue
+
+        match = pattern.search(
+            line["text"]
+        )
+
+        if match:
+
+            return (
+                match.group(1).upper(),
+                line,
+            )
+
+    return None
+
+
+def _v9_explicit_account(lines):
+
+    patterns = [
+        r"(?i)"
+        r"\b(?:bank\s+)?"
+        r"(?:a/?c|account)"
+        r"\s*(?:no|number)?\.?"
+        r"\s*[:=\-]?\s*"
+        r"([0-9]{6,24})",
+
+        r"(?i)"
+        r"\bA/?C\.?\s*No\.?"
+        r"\s*[:=\-]?\s*"
+        r"([0-9]{6,24})",
+    ]
+
+    for line in lines:
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                line["text"],
+            )
+
+            if match:
+
+                return (
+                    match.group(1),
+                    line,
+                )
+
+    return None
+
+
+def _v9_explicit_bank_name(lines):
+
+    for line in lines:
+
+        text = line["text"]
+
+        match = re.search(
+            r"(?i)"
+            r"\bBank\s+Name"
+            r"\s*[:=\-]?\s*"
+            r"(.+)$",
+            text,
+        )
+
+        if not match:
+            continue
+
+        value = _v9_text(
+            match.group(1)
+        )
+
+        # Stop if another bank label appears on same OCR line.
+        value = re.split(
+            r"(?i)\b("
+            r"bank\s+a/?c|"
+            r"account|"
+            r"ifsc|"
+            r"rtgs"
+            r")\b",
+            value,
+            maxsplit=1,
+        )[0].strip(" ,:-")
+
+        if (
+            value
+            and
+            len(value)
+            >=
+            3
+            and
+            len(value)
+            <=
+            120
+        ):
+
+            return (
+                value,
+                line,
+            )
+
+    return None
+
+
+def _v9_explicit_hsn(lines):
+
+    codes = []
+
+    for line in lines:
+
+        text = line["text"]
+
+        if not re.search(
+            r"(?i)\b(?:HSN|SAC)"
+            r"(?:\s*/\s*SAC)?"
+            r"(?:\s+CODE)?\b",
+            text,
+        ):
+            continue
+
+        # Prefer numbers directly following HSN/SAC label.
+        match = re.search(
+            r"(?i)"
+            r"\b(?:HSN|SAC)"
+            r"(?:\s*/\s*SAC)?"
+            r"(?:\s+CODE)?"
+            r"\s*[:=\-]?\s*"
+            r"(\d{4,8})\b",
+            text,
+        )
+
+        if match:
+
+            code = (
+                match.group(1)
+            )
+
+            if len(code) in {
+                4,
+                6,
+                8,
+            }:
+
+                codes.append(
+                    (
+                        code,
+                        line,
+                    )
+                )
+
+    unique = {}
+
+    for code, line in codes:
+
+        unique.setdefault(
+            code,
+            line,
+        )
+
+    # A single explicit document-level HSN/SAC is safe.
+    # Multiple different codes normally mean line-level HSNs,
+    # so don't invent one document-level value.
+    if len(unique) == 1:
+
+        code = next(
+            iter(unique)
+        )
+
+        return (
+            code,
+            unique[code],
+        )
+
+    return None
+
+
+def _v9_explicit_vehicle(lines):
+
+    structural = {
+        "srno",
+        "sr no",
+        "description",
+        "qty",
+        "quantity",
+        "amount",
+        "rate",
+        "gst",
+        "hsn",
+    }
+
+    for line in lines:
+
+        text = line["text"]
+
+        match = re.search(
+            r"(?i)"
+            r"\bVehicle"
+            r"(?:\s*(?:No|Number))?"
+            r"\s*[:=\-]?\s*"
+            r"([A-Z0-9\- ]{4,24})",
+            text,
+        )
+
+        if not match:
+            continue
+
+        value = _v9_text(
+            match.group(1)
+        ).strip(" ,:-")
+
+        normalized = (
+            _v9_norm(value)
+        )
+
+        if (
+            not value
+            or
+            normalized
+            in
+            structural
+        ):
+            continue
+
+        # Require letters AND numbers.
+        if not (
+            re.search(
+                r"[A-Za-z]",
+                value,
+            )
+            and
+            re.search(
+                r"\d",
+                value,
+            )
+        ):
+            continue
+
+        if len(value) > 20:
+            continue
+
+        return (
+            value.upper(),
+            line,
+        )
+
+    return None
+
+
+def _v9_dynamic_payload(
+    value,
+    field_name,
+    evidence,
+    page,
+    source,
+):
+
+    return {
+        "value":
+            value,
+
+        "status":
+            "DETECTED",
+
+        "confidence":
+            1.0,
+
+        "page":
+            page,
+
+        "source":
+            source,
+
+        "evidence":
+            evidence,
+
+        "origin":
+            "AUTO_DYNAMIC",
+
+        "field_name":
+            field_name,
+    }
+
+
+def _v9_remove_bad_dynamic_fields(
+    result,
+):
+
+    fields = result.get(
+        "fields",
+        {}
+    )
+
+    if not isinstance(
+        fields,
+        dict,
+    ):
+        return
+
+    drop_names = {
+        "buyer name address",
+        "buyer name andaddress",
+        "invoice no",
+        "invoiceno",
+        "billamount",
+        "total gst",
+        "gstinn0",
+        "gstinno",
+        "rtgs ifsc code e",
+    }
+
+    for name in list(
+        fields.keys()
+    ):
+
+        item = fields.get(
+            name
+        )
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        if (
+            item.get(
+                "origin"
+            )
+            !=
+            "AUTO_DYNAMIC"
+        ):
+            continue
+
+        normalized = (
+            _v9_norm(name)
+        )
+
+        if (
+            normalized
+            in
+            drop_names
+        ):
+
+            fields.pop(
+                name,
+                None,
+            )
+
+
+def _v9_repair_dynamic(
+    input_path,
+    result,
+    lines,
+):
+
+    _v9_remove_bad_dynamic_fields(
+        result
+    )
+
+    fields = result.setdefault(
+        "fields",
+        {},
+    )
+
+    bank = _v9_explicit_bank_name(
+        lines
+    )
+
+    if bank:
+
+        value, line = bank
+
+        fields[
+            "Bank Name"
+        ] = _v9_dynamic_payload(
+            value,
+            "Bank Name",
+            line["text"],
+            line["page"],
+            "V9_EXPLICIT_BANK",
+        )
+
+    account = _v9_explicit_account(
+        lines
+    )
+
+    if account:
+
+        value, line = account
+
+        fields[
+            "Bank Account Number"
+        ] = _v9_dynamic_payload(
+            value,
+            "Bank Account Number",
+            line["text"],
+            line["page"],
+            "V9_EXPLICIT_ACCOUNT",
+        )
+
+    ifsc = _v9_explicit_ifsc(
+        lines
+    )
+
+    if ifsc:
+
+        value, line = ifsc
+
+        fields[
+            "IFSC Code"
+        ] = _v9_dynamic_payload(
+            value,
+            "IFSC Code",
+            line["text"],
+            line["page"],
+            "V9_EXPLICIT_IFSC",
+        )
+
+    hsn = _v9_explicit_hsn(
+        lines
+    )
+
+    if hsn:
+
+        value, line = hsn
+
+        fields[
+            "HSN Code"
+        ] = _v9_dynamic_payload(
+            value,
+            "HSN Code",
+            line["text"],
+            line["page"],
+            "V9_EXPLICIT_HSN",
+        )
+
+    else:
+
+        # Remove clearly invalid document-level HSN output.
+        hsn_item = fields.get(
+            "HSN Code"
+        )
+
+        if isinstance(
+            hsn_item,
+            dict,
+        ):
+
+            value = str(
+                hsn_item.get(
+                    "value",
+                    ""
+                )
+            )
+
+            if not re.fullmatch(
+                r"\d{4}|\d{6}|\d{8}",
+                value,
+            ):
+
+                fields.pop(
+                    "HSN Code",
+                    None,
+                )
+
+    vehicle = _v9_explicit_vehicle(
+        lines
+    )
+
+    if vehicle:
+
+        value, line = vehicle
+
+        fields[
+            "Vehicle Number"
+        ] = _v9_dynamic_payload(
+            value,
+            "Vehicle Number",
+            line["text"],
+            line["page"],
+            "V9_EXPLICIT_VEHICLE",
+        )
+
+    # Explicitly remove false vehicle values such as SrNo.
+    for bad_name in (
+        "Vehicle No",
+        "Vehicle",
+    ):
+
+        item = fields.get(
+            bad_name
+        )
+
+        if isinstance(
+            item,
+            dict,
+        ):
+
+            value = _v9_norm(
+                item.get(
+                    "value"
+                )
+            )
+
+            if (
+                value
+                in {
+                    "",
+                    "srno",
+                    "sr no",
+                    "description",
+                    "qty",
+                    "quantity",
+                }
+            ):
+
+                fields.pop(
+                    bad_name,
+                    None,
+                )
+
+
+def _v9_apply_financials(
+    result,
+    lines,
+):
+
+    financial = (
+        _v9_financial_candidates(
+            lines
+        )
+    )
+
+    explicit_total = (
+        financial["total"]
+    )
+
+    explicit_subtotal = (
+        financial["subtotal"]
+    )
+
+    discount_info = (
+        financial["discount"]
+    )
+
+    round_info = (
+        financial["round_off"]
+    )
+
+    tax = (
+        financial["tax"]
+    )
+
+    total = (
+        explicit_total[
+            "value"
+        ]
+        if explicit_total
+        else
+        None
+    )
+
+    subtotal = (
+        explicit_subtotal[
+            "value"
+        ]
+        if explicit_subtotal
+        else
+        None
+    )
+
+    discount = (
+        discount_info[
+            "value"
+        ]
+        if discount_info
+        else
+        None
+    )
+
+    round_off = (
+        round_info[
+            "value"
+        ]
+        if round_info
+        else
+        0.0
+    )
+
+    # --------------------------------------------------------
+    # SANITY GATES
+    # --------------------------------------------------------
+
+    if (
+        tax is not None
+        and
+        total is not None
+        and
+        tax
+        >
+        total * 1.5
+    ):
+        tax = None
+
+    # --------------------------------------------------------
+    # ARITHMETIC RECONCILIATION
+    # --------------------------------------------------------
+
+    tolerance = 1.25
+
+    if (
+        subtotal is not None
+        and
+        tax is not None
+        and
+        total is not None
+    ):
+
+        effective_discount = (
+            discount
+            or
+            0.0
+        )
+
+        calculated = (
+            subtotal
+            -
+            effective_discount
+            +
+            tax
+            +
+            round_off
+        )
+
+        difference = abs(
+            calculated
+            -
+            total
+        )
+
+        if difference <= tolerance:
+
+            _v9_set_trained(
+                result,
+                "SUBTOTAL",
+                _v9_format_amount(
+                    subtotal
+                ),
+                "V9_EXPLICIT_SUMMARY",
+            )
+
+            _v9_set_trained(
+                result,
+                "TAX",
+                _v9_format_amount(
+                    tax
+                ),
+                "V9_GST_COMPONENT_SUM",
+            )
+
+            _v9_set_trained(
+                result,
+                "TOTAL_AMOUNT",
+                _v9_format_amount(
+                    total
+                ),
+                "V9_EXPLICIT_FINAL_TOTAL",
+            )
+
+            if (
+                discount_info
+                is not None
+            ):
+
+                _v9_set_trained(
+                    result,
+                    "DISCOUNT",
+                    _v9_format_amount(
+                        discount
+                    ),
+                    "V9_EXPLICIT_DISCOUNT",
+                )
+
+        else:
+
+            # Explicit highest-priority final totals are still
+            # safer than a tax-component value accidentally
+            # selected as TOTAL_AMOUNT.
+            if explicit_total:
+
+                _v9_set_trained(
+                    result,
+                    "TOTAL_AMOUNT",
+                    _v9_format_amount(
+                        total
+                    ),
+                    "V9_EXPLICIT_FINAL_TOTAL",
+                )
+
+            if (
+                tax is not None
+                and
+                total is not None
+                and
+                tax < total
+            ):
+
+                _v9_set_trained(
+                    result,
+                    "TAX",
+                    _v9_format_amount(
+                        tax
+                    ),
+                    "V9_GST_COMPONENT_SUM",
+                )
+
+            if explicit_subtotal:
+
+                _v9_set_trained(
+                    result,
+                    "SUBTOTAL",
+                    _v9_format_amount(
+                        subtotal
+                    ),
+                    "V9_EXPLICIT_SUMMARY",
+                )
+
+    else:
+
+        if explicit_total:
+
+            _v9_set_trained(
+                result,
+                "TOTAL_AMOUNT",
+                _v9_format_amount(
+                    total
+                ),
+                "V9_EXPLICIT_FINAL_TOTAL",
+            )
+
+        if (
+            tax is not None
+            and
+            total is not None
+            and
+            tax < total
+        ):
+
+            _v9_set_trained(
+                result,
+                "TAX",
+                _v9_format_amount(
+                    tax
+                ),
+                "V9_GST_COMPONENT_SUM",
+            )
+
+        if explicit_subtotal:
+
+            _v9_set_trained(
+                result,
+                "SUBTOTAL",
+                _v9_format_amount(
+                    subtotal
+                ),
+                "V9_EXPLICIT_SUMMARY",
+            )
+
+    # --------------------------------------------------------
+    # ROUND-OFF
+    # --------------------------------------------------------
+
+    if round_info:
+
+        result[
+            "round_off"
+        ] = {
+            "value":
+                round_off,
+
+            "page":
+                round_info[
+                    "page"
+                ],
+
+            "row_text":
+                round_info[
+                    "evidence"
+                ],
+
+            "source":
+                "V9_EXPLICIT_ROUND_OFF",
+        }
+
+        details = result.setdefault(
+            "financial_details",
+            {},
+        )
+
+        details[
+            "round_off"
+        ] = {
+            "value":
+                round_off,
+
+            "page":
+                round_info[
+                    "page"
+                ],
+
+            "row_text":
+                round_info[
+                    "evidence"
+                ],
+
+            "source":
+                "V9_EXPLICIT_ROUND_OFF",
+        }
+
+    # --------------------------------------------------------
+    # TAX DETAILS
+    # --------------------------------------------------------
+
+    if tax is not None:
+
+        tax_details = result.setdefault(
+            "tax_details",
+            {},
+        )
+
+        tax_details[
+            "total_tax"
+        ] = tax
+
+        components = []
+
+        for label, item in (
+            (
+                "CGST",
+                financial[
+                    "cgst"
+                ],
+            ),
+            (
+                "SGST",
+                financial[
+                    "sgst"
+                ],
+            ),
+            (
+                "IGST",
+                financial[
+                    "igst"
+                ],
+            ),
+        ):
+
+            if item:
+
+                components.append(
+                    {
+                        "type":
+                            label,
+
+                        "amount":
+                            item[
+                                "value"
+                            ],
+
+                        "page":
+                            item[
+                                "page"
+                            ],
+
+                        "source":
+                            "V9_EXPLICIT_TAX_COMPONENT",
+                    }
+                )
+
+        tax_details[
+            "gst_components"
+        ] = components
+
+
+def _v9_apply_party_and_core(
+    result,
+    lines,
+):
+
+    vendor = _v9_field_value(
+        result,
+        "VENDOR_NAME",
+    )
+
+    current_customer = (
+        _v9_field_value(
+            result,
+            "CUSTOMER_NAME",
+        )
+    )
+
+    bad_customer = (
+        _v9_norm(
+            current_customer
+        )
+        in {
+            "",
+            "name",
+            "buyer",
+            "customer",
+            "bill to",
+            "ship to",
+            "pan state code state name",
+        }
+    )
+
+    if bad_customer:
+
+        recovered = (
+            _v9_company_from_customer_block(
+                lines,
+                vendor_name=
+                    vendor,
+            )
+        )
+
+        if recovered:
+
+            _v9_set_trained(
+                result,
+                "CUSTOMER_NAME",
+                recovered,
+                "V9_CUSTOMER_BLOCK",
+            )
+
+    currency = (
+        _v9_field_value(
+            result,
+            "CURRENCY",
+        )
+    )
+
+    if _v9_is_missing(
+        currency
+    ):
+
+        recovered_currency = (
+            _v9_explicit_currency(
+                lines
+            )
+        )
+
+        if recovered_currency:
+
+            _v9_set_trained(
+                result,
+                "CURRENCY",
+                recovered_currency,
+                "V9_EXPLICIT_CURRENCY",
+            )
+
+    terms = (
+        _v9_field_value(
+            result,
+            "PAYMENT_TERMS",
+        )
+    )
+
+    if _v9_is_missing(
+        terms
+    ):
+
+        recovered_terms = (
+            _v9_recover_payment_terms(
+                lines
+            )
+        )
+
+        if recovered_terms:
+
+            _v9_set_trained(
+                result,
+                "PAYMENT_TERMS",
+                recovered_terms,
+                "V9_EXPLICIT_PAYMENT_TERMS",
+            )
+
+    due = (
+        _v9_field_value(
+            result,
+            "DUE_DATE",
+        )
+    )
+
+    if _v9_is_missing(
+        due
+    ):
+
+        recovered_due = (
+            _v9_recover_due_date(
+                lines
+            )
+        )
+
+        if recovered_due:
+
+            _v9_set_trained(
+                result,
+                "DUE_DATE",
+                recovered_due,
+                "V9_EXPLICIT_DUE_DATE",
+            )
+
+
+def _v9_refresh_output_metadata(
+    result,
+):
+
+    fields = result.get(
+        "fields",
+        {}
+    )
+
+    if not isinstance(
+        fields,
+        dict,
+    ):
+        return
+
+    # --------------------------------------------------------
+    # NORMALIZED VALUES
+    # --------------------------------------------------------
+
+    normalized = result.setdefault(
+        "normalized",
+        {},
+    )
+
+    mapping = {
+        "subtotal":
+            "SUBTOTAL",
+
+        "tax":
+            "TAX",
+
+        "discount":
+            "DISCOUNT",
+
+        "total_amount":
+            "TOTAL_AMOUNT",
+    }
+
+    for normalized_name, field_name in (
+        mapping.items()
+    ):
+
+        normalized[
+            normalized_name
+        ] = _v9_number(
+            _v9_field_value(
+                result,
+                field_name,
+            )
+        )
+
+    currency = _v9_field_value(
+        result,
+        "CURRENCY",
+    )
+
+    if not _v9_is_missing(
+        currency
+    ):
+        normalized[
+            "currency"
+        ] = currency
+
+    # --------------------------------------------------------
+    # FINANCIAL VALIDATION
+    # --------------------------------------------------------
+
+    subtotal = _v9_number(
+        _v9_field_value(
+            result,
+            "SUBTOTAL",
+        )
+    )
+
+    discount = _v9_number(
+        _v9_field_value(
+            result,
+            "DISCOUNT",
+        )
+    ) or 0.0
+
+    tax = _v9_number(
+        _v9_field_value(
+            result,
+            "TAX",
+        )
+    )
+
+    total = _v9_number(
+        _v9_field_value(
+            result,
+            "TOTAL_AMOUNT",
+        )
+    )
+
+    round_off = 0.0
+
+    round_info = result.get(
+        "round_off"
+    )
+
+    if isinstance(
+        round_info,
+        dict,
+    ):
+
+        round_off = (
+            _v9_number(
+                round_info.get(
+                    "value"
+                )
+            )
+            or
+            0.0
+        )
+
+    validation = result.setdefault(
+        "validation",
+        {},
+    )
+
+    financial = validation.setdefault(
+        "financial_reconciliation",
+        {},
+    )
+
+    calculated = None
+    difference = None
+    passed = False
+
+    if (
+        subtotal is not None
+        and
+        tax is not None
+        and
+        total is not None
+    ):
+
+        calculated = (
+            subtotal
+            -
+            discount
+            +
+            tax
+            +
+            round_off
+        )
+
+        difference = abs(
+            calculated
+            -
+            total
+        )
+
+        passed = (
+            difference
+            <=
+            1.25
+        )
+
+    financial.update(
+        {
+            "subtotal":
+                subtotal,
+
+            "tax":
+                tax,
+
+            "discount":
+                (
+                    discount
+                    if discount
+                    else None
+                ),
+
+            "round_off":
+                round_off,
+
+            "total_amount":
+                total,
+
+            "calculated_total":
+                calculated,
+
+            "difference":
+                difference,
+
+            "passed":
+                passed,
+        }
+    )
+
+    # --------------------------------------------------------
+    # DYNAMIC METADATA
+    # --------------------------------------------------------
+
+    auto_dynamic = []
+
+    for name, item in fields.items():
+
+        if (
+            isinstance(
+                item,
+                dict,
+            )
+            and
+            item.get(
+                "origin"
+            )
+            ==
+            "AUTO_DYNAMIC"
+        ):
+
+            auto_dynamic.append(
+                name
+            )
+
+    result[
+        "auto_discovered_parameters"
+    ] = list(
+        auto_dynamic
+    )
+
+    resolved = 0
+    unresolved = 0
+
+    for item in fields.values():
+
+        value = (
+            item.get(
+                "value"
+            )
+            if isinstance(
+                item,
+                dict,
+            )
+            else
+            item
+        )
+
+        if _v9_is_missing(
+            value
+        ):
+            unresolved += 1
+        else:
+            resolved += 1
+
+    result[
+        "field_summary"
+    ] = {
+        "total_fields":
+            len(fields),
+
+        "trained_schema_fields":
+            len(
+                EXPECTED_FIELDS
+            ),
+
+        "auto_dynamic_fields":
+            len(
+                auto_dynamic
+            ),
+
+        "resolved_fields":
+            resolved,
+
+        "unresolved_fields":
+            unresolved,
+    }
+
+    runtime = result.setdefault(
+        "runtime",
+        {},
+    )
+
+    runtime[
+        "runtime_quality_layer"
+    ] = (
+        "V9_GENERALIZED_RECONCILIATION"
+    )
+
+
+def process_invoice_dynamic_final(
+    input_path,
+    *,
+    min_dynamic_confidence=
+        DYNAMIC_MIN_CONFIDENCE,
+):
+
+    result = (
+        _PROCESS_INVOICE_DYNAMIC_FINAL_BEFORE_V9(
+            input_path,
+            min_dynamic_confidence=
+                min_dynamic_confidence,
+        )
+    )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return result
+
+    lines = (
+        _v9_document_lines(
+            input_path
+        )
+    )
+
+    if not lines:
+
+        return result
+
+    # --------------------------------------------------------
+    # GENERALIZED V9 LAYERS
+    # --------------------------------------------------------
+
+    _v9_apply_party_and_core(
+        result,
+        lines,
+    )
+
+    _v9_repair_dynamic(
+        input_path,
+        result,
+        lines,
+    )
+
+    _v9_apply_financials(
+        result,
+        lines,
+    )
+
+    _v9_refresh_output_metadata(
+        result
+    )
+
+    return result
+
+
+# Refresh public aliases so every public entry point resolves
+# to the new V9 wrapper explicitly.
+
+def process_invoice_unified(
+    input_path,
+    *,
+    min_dynamic_confidence=
+        DYNAMIC_MIN_CONFIDENCE,
+):
+
+    return process_invoice_dynamic_final(
+        input_path,
+        min_dynamic_confidence=
+            min_dynamic_confidence,
+    )
+
+
+def process_invoice_latest(
+    input_path,
+    *,
+    min_dynamic_confidence=
+        DYNAMIC_MIN_CONFIDENCE,
+):
+
+    return process_invoice_dynamic_final(
+        input_path,
+        min_dynamic_confidence=
+            min_dynamic_confidence,
+    )
+
+
+# ============================================================
+# END INVOICE_AI_V9_GENERALIZED_RECONCILIATION
+# ============================================================
+
+

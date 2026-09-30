@@ -2756,6 +2756,285 @@ def _dynamic_pdf_cache_key(
         )
 
 
+
+
+# ============================================================
+# INVOICE_AI_OCR_DYNAMIC_LINES_V3
+#
+# Scanned/image-only PDF support for automatic dynamic schema
+# discovery.
+#
+# Native PDFs continue to use PyMuPDF text.
+# Scanned PDFs reuse the existing production OCR ingestion
+# pipeline.
+#
+# No retraining.
+# No model weight changes.
+# ============================================================
+
+def _dynamic_ocr_lines_v3(input_path):
+
+    import shutil
+    import tempfile
+
+    try:
+
+        engine = load_v3_production_engine()
+
+        runtime_namespace = engine.get(
+            "runtime_namespace",
+            {},
+        )
+
+        ingest_document = runtime_namespace.get(
+            "_ingest_document"
+        )
+
+        prod_work_root = runtime_namespace.get(
+            "PROD_WORK_ROOT"
+        )
+
+        if not callable(ingest_document):
+            return []
+
+        if prod_work_root is None:
+            return []
+
+        prod_work_root = Path(prod_work_root)
+
+        prod_work_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        work_dir = Path(
+            tempfile.mkdtemp(
+                prefix="dynamic_ocr_",
+                dir=str(prod_work_root),
+            )
+        )
+
+        try:
+
+            pages = ingest_document(
+                Path(input_path),
+                work_dir,
+            )
+
+            output = []
+
+            for page in pages or []:
+
+                page_number = int(
+                    page.get(
+                        "page_number",
+                        1,
+                    )
+                )
+
+                words = page.get(
+                    "words",
+                    [],
+                ) or []
+
+                boxes = page.get(
+                    "boxes",
+                    [],
+                ) or []
+
+                records = []
+
+                for word, box in zip(
+                    words,
+                    boxes,
+                ):
+
+                    text = str(word).strip()
+
+                    if not text:
+                        continue
+
+                    if (
+                        not isinstance(
+                            box,
+                            (list, tuple),
+                        )
+                        or
+                        len(box) < 4
+                    ):
+                        continue
+
+                    try:
+
+                        x0 = float(box[0])
+                        y0 = float(box[1])
+                        x1 = float(box[2])
+                        y1 = float(box[3])
+
+                    except Exception:
+                        continue
+
+                    records.append(
+                        {
+                            "text": text,
+                            "x0": x0,
+                            "y0": y0,
+                            "x1": x1,
+                            "y1": y1,
+                            "yc": (y0 + y1) / 2.0,
+                        }
+                    )
+
+                records.sort(
+                    key=lambda item: (
+                        item["yc"],
+                        item["x0"],
+                    )
+                )
+
+                rows = []
+
+                y_tolerance = 7.0
+
+                for record in records:
+
+                    target = None
+
+                    for row in reversed(
+                        rows[-8:]
+                    ):
+
+                        if abs(
+                            record["yc"]
+                            -
+                            row["yc"]
+                        ) <= y_tolerance:
+
+                            target = row
+                            break
+
+                    if target is None:
+
+                        target = {
+                            "yc": record["yc"],
+                            "words": [],
+                        }
+
+                        rows.append(target)
+
+                    target["words"].append(
+                        record
+                    )
+
+                    target["yc"] = (
+                        sum(
+                            item["yc"]
+                            for item
+                            in target["words"]
+                        )
+                        /
+                        len(
+                            target["words"]
+                        )
+                    )
+
+                for row in rows:
+
+                    row_words = row["words"]
+
+                    row_words.sort(
+                        key=lambda item:
+                            item["x0"]
+                    )
+
+                    text = " ".join(
+                        item["text"]
+                        for item
+                        in row_words
+                    ).strip()
+
+                    if not text:
+                        continue
+
+                    output.append(
+                        {
+                            "page": page_number,
+                            "text": text,
+                            "x0": min(
+                                item["x0"]
+                                for item
+                                in row_words
+                            ),
+                            "y0": min(
+                                item["y0"]
+                                for item
+                                in row_words
+                            ),
+                            "x1": max(
+                                item["x1"]
+                                for item
+                                in row_words
+                            ),
+                            "y1": max(
+                                item["y1"]
+                                for item
+                                in row_words
+                            ),
+                            "source":
+                                "OCR_DYNAMIC_V3",
+                        }
+                    )
+
+            output.sort(
+                key=lambda item: (
+                    int(
+                        item.get(
+                            "page",
+                            1,
+                        )
+                    ),
+                    float(
+                        item.get(
+                            "y0",
+                            0.0,
+                        )
+                    ),
+                    float(
+                        item.get(
+                            "x0",
+                            0.0,
+                        )
+                    ),
+                )
+            )
+
+            if output:
+
+                print(
+                    "Dynamic OCR lines ready:",
+                    len(output),
+                )
+
+            return output
+
+        finally:
+
+            shutil.rmtree(
+                work_dir,
+                ignore_errors=True,
+            )
+
+    except Exception as exc:
+
+        print(
+            "OCR dynamic discovery fallback failed:",
+            type(exc).__name__,
+            str(exc),
+        )
+
+        return []
+
+
 def _dynamic_pdf_lines(
     input_path,
 ):
@@ -3001,6 +3280,17 @@ def _dynamic_pdf_lines(
     # Keep the cache intentionally tiny. Streamlit uploads use
     # temporary paths, so old entries provide no long-term
     # benefit.
+
+    # ========================================================
+    # OCR FALLBACK FOR SCANNED / IMAGE-ONLY PDF
+    # ========================================================
+
+    if not lines:
+
+        lines = _dynamic_ocr_lines_v3(
+            path
+        )
+
     _DYNAMIC_PDF_LINES_CACHE.clear()
 
     _DYNAMIC_PDF_LINES_CACHE[

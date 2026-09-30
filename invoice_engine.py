@@ -17692,3 +17692,419 @@ def process_invoice_latest(
 # ============================================================
 
 
+
+# ============================================================
+# INVOICE_AI_V10_STABILITY_GATE
+# ============================================================
+#
+# Non-destructive final safety layer.
+#
+# Objective:
+# a later heuristic must not replace a more plausible value
+# with an impossible or arithmetically worse value.
+# ============================================================
+
+_PROCESS_INVOICE_DYNAMIC_FINAL_BEFORE_V10_STABILITY = (
+    process_invoice_dynamic_final
+)
+
+
+def _v10_num(value):
+
+    try:
+
+        if isinstance(
+            value,
+            dict,
+        ):
+            value = value.get(
+                "value"
+            )
+
+        if value is None:
+            return None
+
+        text = (
+            str(value)
+            .replace(",", "")
+            .replace("?", "")
+            .replace("INR", "")
+            .strip()
+        )
+
+        match = re.search(
+            r"[-+]?\d+(?:\.\d+)?",
+            text,
+        )
+
+        if not match:
+            return None
+
+        return float(
+            match.group(0)
+        )
+
+    except Exception:
+        return None
+
+
+def _v10_field(
+    payload,
+    name,
+):
+
+    fields = (
+        payload.get(
+            "fields",
+            {}
+        )
+        if isinstance(
+            payload,
+            dict,
+        )
+        else
+        {}
+    )
+
+    item = fields.get(
+        name
+    )
+
+    if isinstance(
+        item,
+        dict,
+    ):
+        return item.get(
+            "value"
+        )
+
+    return item
+
+
+def _v10_plausible_financial_set(
+    payload,
+):
+
+    subtotal = _v10_num(
+        _v10_field(
+            payload,
+            "SUBTOTAL",
+        )
+    )
+
+    discount = _v10_num(
+        _v10_field(
+            payload,
+            "DISCOUNT",
+        )
+    ) or 0.0
+
+    tax = _v10_num(
+        _v10_field(
+            payload,
+            "TAX",
+        )
+    ) or 0.0
+
+    total = _v10_num(
+        _v10_field(
+            payload,
+            "TOTAL_AMOUNT",
+        )
+    )
+
+    if (
+        subtotal is None
+        or
+        total is None
+        or
+        total <= 0
+        or
+        subtotal < 0
+        or
+        tax < 0
+    ):
+        return (
+            False,
+            None,
+        )
+
+    if tax > total:
+        return (
+            False,
+            None,
+        )
+
+    calculated = (
+        subtotal
+        -
+        discount
+        +
+        tax
+    )
+
+    difference = abs(
+        calculated
+        -
+        total
+    )
+
+    tolerance = max(
+        1.25,
+        abs(total)
+        *
+        0.005,
+    )
+
+    return (
+        difference
+        <=
+        tolerance,
+        difference,
+    )
+
+
+def _v10_clean_dynamic(
+    result,
+):
+
+    fields = result.get(
+        "fields",
+        {}
+    )
+
+    if not isinstance(
+        fields,
+        dict,
+    ):
+        return
+
+    canonical = {
+        "IFSC Code": [
+            "Bank IFSC code",
+            "RTGS/IFSC Code",
+            "RTGS IFSC Code",
+        ],
+
+        "Bank Account Number": [
+            "Bank Account No.",
+            "Bank A/c No.",
+            "Account Number",
+        ],
+    }
+
+    for canonical_name, aliases in (
+        canonical.items()
+    ):
+
+        if canonical_name not in fields:
+
+            for alias in aliases:
+
+                if alias in fields:
+
+                    fields[
+                        canonical_name
+                    ] = fields[
+                        alias
+                    ]
+
+                    break
+
+        for alias in aliases:
+
+            if alias != canonical_name:
+
+                fields.pop(
+                    alias,
+                    None,
+                )
+
+    for name in list(
+        fields.keys()
+    ):
+
+        item = fields.get(
+            name
+        )
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        if (
+            item.get(
+                "origin"
+            )
+            !=
+            "AUTO_DYNAMIC"
+        ):
+            continue
+
+        value = str(
+            item.get(
+                "value",
+                ""
+            )
+        ).strip()
+
+        normalized = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            value.lower(),
+        )
+
+        lname = name.lower()
+
+        if (
+            "vehicle"
+            in
+            lname
+            and
+            normalized
+            in {
+                "",
+                "srno",
+                "sr",
+                "description",
+                "qty",
+                "amount",
+                "rate",
+            }
+        ):
+            fields.pop(
+                name,
+                None,
+            )
+            continue
+
+        if (
+            "hsn"
+            in
+            lname
+            and
+            not re.fullmatch(
+                r"\d{4}|\d{6}|\d{8}",
+                value,
+            )
+        ):
+            fields.pop(
+                name,
+                None,
+            )
+            continue
+
+
+def process_invoice_dynamic_final(
+    input_path,
+    *,
+    min_dynamic_confidence=
+        DYNAMIC_MIN_CONFIDENCE,
+):
+
+    result = (
+        _PROCESS_INVOICE_DYNAMIC_FINAL_BEFORE_V10_STABILITY(
+            input_path,
+            min_dynamic_confidence=
+                min_dynamic_confidence,
+        )
+    )
+
+    # Final layers are fail-soft.
+    try:
+
+        _v10_clean_dynamic(
+            result
+        )
+
+    except Exception as exc:
+
+        print(
+            "?? V10 dynamic safety skipped:",
+            type(exc).__name__,
+            str(exc),
+        )
+
+    try:
+
+        valid, difference = (
+            _v10_plausible_financial_set(
+                result
+            )
+        )
+
+        validation = result.setdefault(
+            "validation",
+            {},
+        )
+
+        gate = validation.setdefault(
+            "v10_stability_gate",
+            {},
+        )
+
+        gate["financially_plausible"] = (
+            bool(valid)
+        )
+
+        gate["difference"] = (
+            difference
+        )
+
+        if not valid:
+
+            result["status"] = (
+                "REVIEW_REQUIRED"
+            )
+
+    except Exception as exc:
+
+        print(
+            "?? V10 financial gate skipped:",
+            type(exc).__name__,
+            str(exc),
+        )
+
+    result.setdefault(
+        "runtime",
+        {},
+    )[
+        "runtime_quality_layer"
+    ] = (
+        "V10_STABILIZED"
+    )
+
+    return result
+
+
+def process_invoice_unified(
+    input_path,
+    *,
+    min_dynamic_confidence=
+        DYNAMIC_MIN_CONFIDENCE,
+):
+
+    return process_invoice_dynamic_final(
+        input_path,
+        min_dynamic_confidence=
+            min_dynamic_confidence,
+    )
+
+
+def process_invoice_latest(
+    input_path,
+    *,
+    min_dynamic_confidence=
+        DYNAMIC_MIN_CONFIDENCE,
+):
+
+    return process_invoice_dynamic_final(
+        input_path,
+        min_dynamic_confidence=
+            min_dynamic_confidence,
+    )
+
+
+
